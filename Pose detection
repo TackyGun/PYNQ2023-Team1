@@ -1,0 +1,133 @@
+import os                         # used to execute bash commands to download and uncompress stuff
+import cv2                        # OpenCV image processing library
+import numpy as np                # For math
+import matplotlib.pyplot as plt   # For plotting stuff
+from pynq_dpu import DpuOverlay   # Overlay for the FPGA
+import IPython.display            # For displaying a live feed of video
+
+overlay = DpuOverlay("dpu.bit")
+
+archive_filename = "openpose_pruned_0_3.tar.gz"
+extracted_model_path = "openpose_pruned_0_3.xmodel"
+# The following will download the model if it is not already present in the folder:
+# model_download_url = "https://www.xilinx.com/bin/public/openDownload?filename=openpose_pruned_0_3-zcu102_zcu104_kv260-r2.5.0.tar.gz"
+# os.system("wget -nv -O \"{}\" \"{}\"".format(archive_filename, model_download_url))
+# os.system("tar -xvf \"{}\"".format(archive_filename))
+overlay.load_model(extracted_model_path)
+
+img = cv2.imread("img/test_image.jpeg")
+# img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # Need BGR for OpenPose
+height, width = img.shape[0], img.shape[1]
+aspect_ratio = width / height
+width, height, aspect_ratio, plt.imshow(img)
+
+dpu = overlay.runner
+
+inputTensors = dpu.get_input_tensors()
+outputTensors = dpu.get_output_tensors()
+
+shapeIn = tuple(inputTensors[0].dims)
+shapeOut = tuple(outputTensors[0].dims)
+outputSize = int(outputTensors[0].get_data_size() / shapeIn[0])
+shapeIn, shapeOut, outputSize
+
+dpu = overlay.runner
+
+inputTensors = dpu.get_input_tensors()
+outputTensors = dpu.get_output_tensors()
+
+shapeIn = tuple(inputTensors[0].dims)
+shapeOut = tuple(outputTensors[0].dims)
+outputSize = int(outputTensors[0].get_data_size() / shapeIn[0])
+shapeIn, shapeOut, outputSize
+xpad = 0
+ypad = 20
+canvas = 255*np.ones((height+2*ypad, width+2*xpad, 3), dtype=img.dtype)
+canvas[ypad:height+ypad, xpad:width+xpad, :] = img
+img = canvas
+plt.imshow(canvas)
+
+new_height = shapeIn[1]
+img_resized = cv2.resize(img, 
+                         (int(aspect_ratio*new_height),   # new width; maintain aspect ratio
+                          new_height))                    # new height
+img_cropped = img_resized[0:shapeIn[1],0:shapeIn[2],:].reshape((shapeIn[1],shapeIn[2],3))
+img_cropped = img_cropped.astype(np.float32) / 255.0  # Make it floats
+plt.imshow(img_cropped), img_cropped.shape
+
+# Prepare an array of zeros with the correct output dimensions; the DPU will fill in the results in here, but we 
+# have to prepare some space for it.
+output_data = [np.zeros(shapeOut, dtype=np.float32, order="C")]
+
+# We will be putting our image into this array:
+input_data = [np.zeros(shapeIn, dtype=np.float32, order="C")]
+# ... but first, we must adjust the shape of the matrix slightly ...
+processed_image = img_cropped
+processed_image = processed_image.reshape(shapeIn).astype(np.float32, order="C")
+input_data[0] = processed_image
+
+# Now, we can send our input to the model ...
+job_id = dpu.execute_async(input_data, output_data)
+# ... and wait for it to be done doing its calculation
+dpu.wait(job_id)
+
+# Now, the results are in output_data
+
+plt.imshow(img_cropped)
+heatmap = np.squeeze(np.max(output_data[0][0][:][:][:],axis=2))
+heatmap = cv2.resize(heatmap, (shapeIn[2], shapeIn[1]))
+plt.imshow(heatmap, cmap='hot', interpolation='nearest', alpha=0.4)
+
+def preprocess_image(img):
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) # Need BGR for OpenPose
+
+    # Get dimensions
+    height, width = img.shape[0], img.shape[1]
+    aspect_ratio = width / height
+    width, height, aspect_ratio, plt.imshow(img)
+    
+    # Padding
+    xpad = 0
+    ypad = 20
+    canvas = 255*np.ones((height+2*ypad, width+2*xpad, 3), dtype=img.dtype)
+    canvas[ypad:height+ypad, xpad:width+xpad, :] = img
+    img = canvas
+    
+    # Crop
+    new_width = shapeIn[1]
+    img_resized = cv2.resize(img, (int(aspect_ratio*new_width), new_width))
+    img_cropped = img_resized[0:shapeIn[1],0:shapeIn[2],:].reshape((shapeIn[1],shapeIn[2],3))
+    img_cropped = img_cropped.astype(np.float32) / 255.0  # Make it floats
+    
+    return img_cropped
+
+def run_model(img_cropped):
+    processed_image = img_cropped
+    processed_image = processed_image.reshape(shapeIn).astype(np.float32, order="C")
+    output_data = [np.zeros(shapeOut, dtype=np.float32, order="C")]
+    input_data = [np.zeros(shapeIn, dtype=np.float32, order="C")]
+    input_data[0] = processed_image
+    job_id = dpu.execute_async(input_data, output_data)
+    dpu.wait(job_id)
+    return output_data[0]
+# Setup
+capture = cv2.VideoCapture(0)  # Get a handle on the camera; if you have multiple cameras, you can use different indices
+capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Disable buffering
+capture.set(3, shapeIn[1])   # set input width
+capture.set(4, shapeIn[2])   # set input height
+n_frames = 5
+
+for i in range(n_frames):
+    success, newimg = capture.read()
+    if not success:
+        print("Error reading webcam image.")
+        break
+    img_cropped = preprocess_image(newimg)
+    output = run_model(img_cropped)
+    plt.imshow(img_cropped)
+    heatmap = np.squeeze(np.max(output[0][:][:][:],axis=2))
+    heatmap = cv2.resize(heatmap, (shapeIn[2], shapeIn[1]))
+    plt.imshow(heatmap, cmap='hot', interpolation='nearest', alpha=0.4)
+    IPython.display.clear_output(wait=True)
+    IPython.display.display(plt.gcf())
+
